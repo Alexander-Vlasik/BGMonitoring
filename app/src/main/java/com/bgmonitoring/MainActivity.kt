@@ -5,21 +5,22 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -30,21 +31,25 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.bgmonitoring.shizuku.ShizukuHelper
 import com.bgmonitoring.ui.MainViewModel
+import com.bgmonitoring.ui.MainViewModel.AnalyzeState
 import com.bgmonitoring.ui.UiState
 import com.bgmonitoring.ui.theme.BGMonitoringTheme
-import androidx.compose.foundation.Image
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.platform.LocalContext
-import androidx.core.graphics.drawable.toBitmap
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     private val viewModel by viewModels<MainViewModel>()
@@ -71,7 +76,8 @@ class MainActivity : ComponentActivity() {
                         viewModel.refreshStatus()
                     },
                     onSelectApp = viewModel::selectPackage,
-                    onBack = viewModel::backToList
+                    onBack = viewModel::backToList,
+                    onAnalyze = viewModel::analyzeSelected
                 )
             }
         }
@@ -87,7 +93,8 @@ fun MainScreen(
     onRequestBattery: () -> Unit,
     onRequestShizuku: () -> Unit,
     onSelectApp: (String) -> Unit,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onAnalyze: () -> Unit
 ) {
     Scaffold(modifier = Modifier.fillMaxSize()) { inner ->
         if (state.selectedPackage == null) {
@@ -105,7 +112,8 @@ fun MainScreen(
                 onTargetChange = onTargetChange,
                 onCollect = onCollect,
                 onTogglePeriodic = { onTogglePeriodic(it) },
-                onBack = onBack
+                onBack = onBack,
+                onAnalyze = onAnalyze
             )
         }
     }
@@ -210,7 +218,8 @@ private fun AppDetailScreen(
     onTargetChange: (String) -> Unit,
     onCollect: () -> Unit,
     onTogglePeriodic: (Boolean) -> Unit,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onAnalyze: () -> Unit
 ) {
     val pkg = state.selectedPackage ?: return
     val count = state.snapshotCounts[pkg] ?: 0
@@ -259,35 +268,96 @@ private fun AppDetailScreen(
                 )
             }
         }
+        Button(
+            onClick = onAnalyze,
+            enabled = count > 0 && state.analysisState !is AnalyzeState.Running
+        ) {
+            if (state.analysisState is AnalyzeState.Running) {
+                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+            } else {
+                Text("Analyze")
+            }
+        }
         Divider()
-        Text("Последние снимки:")
-        SnapshotList(pkg = pkg, rootPath = state.snapshotsPath, version = state.snapshotVersion)
+        AnalysisSection(
+            state = state.analysisState,
+            pkg = pkg,
+            snapshotsPath = state.snapshotsPath,
+            modifier = Modifier.weight(1f, fill = true)
+        )
     }
 }
 
 @Composable
-private fun SnapshotList(pkg: String, rootPath: String, version: Int) {
-    val snaps = remember(pkg, version) {
-        val pkgDir = File(rootPath, pkg)
-        pkgDir.listFiles()?.sortedByDescending { it.name } ?: emptyList()
-    }
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(280.dp)
-    ) {
-        items(snaps) { snap ->
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 6.dp)
+private fun AnalysisSection(state: AnalyzeState, pkg: String, snapshotsPath: String, modifier: Modifier = Modifier) {
+    when (state) {
+        AnalyzeState.Idle -> {}
+        AnalyzeState.Running -> {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Text(snap.name, fontWeight = FontWeight.Medium)
-                snap.listFiles()?.forEach { file ->
-                    Text("• ${file.name}")
+                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                Text("Analyzing snapshots…")
+            }
+        }
+
+        is AnalyzeState.Error -> {
+            Text("Analyze error: ${state.message}")
+        }
+
+        is AnalyzeState.Success -> {
+            val result = state.result
+            val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+            val scroll = rememberScrollState()
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = modifier.verticalScroll(scroll)
+            ) {
+                val start = fmt.format(Date(result.coverage.startTs))
+                val end = fmt.format(Date(result.coverage.endTs))
+                Text("Coverage: ${result.coverage.count} snapshots, $start – $end")
+                Text("Bucket timeline:")
+                result.timeline.entries.forEach { entry ->
+                    Text("• ${entry.dirName}: ${entry.bucket}" + if (entry.bucketChanged) " (changed)" else "")
+                }
+                Text("Job stats:")
+                result.timeline.entries.lastOrNull()?.let { last ->
+                    Text("Total=${last.jobStats.total} run=${last.jobStats.running} pend=${last.jobStats.pending} wait=${last.jobStats.waiting} canc=${last.jobStats.cancelled} fin=${last.jobStats.finished}")
+                    Text("Blocked: quota=${last.jobStats.blockedWithinQuota} idle=${last.jobStats.blockedIdle}")
+                    if (last.jobStats.constraintsBlocked.isNotEmpty()) {
+                        val top = last.jobStats.constraintsBlocked.entries.take(3)
+                        Text("Top blocked constraints: " + top.joinToString { "${it.key}=${it.value}" })
+                    }
+                }
+                result.timeline.entries.lastOrNull()?.quota?.let { q ->
+                    Text("Quota hint: remainingTime=${q.timeMs ?: -1}ms remainingCount=${q.remainingCount ?: -1}")
+                }
+                val changes = result.timeline.entries.flatMap { it.appOpsChanges }
+                if (changes.isEmpty()) {
+                    Text("AppOps changes: none")
+                } else {
+                    Text("AppOps changes:")
+                    changes.forEach { change ->
+                        Text(
+                            "• ${change.op}: ${change.from ?: "(new)"} -> ${change.to ?: "(removed)"}",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                val latest = result.timeline.entries.lastOrNull()
+                if (latest != null) {
+                    val summaryPath = File(File(snapshotsPath, pkg), latest.dirName).resolve("summary.md")
+                    if (summaryPath.exists()) {
+                        Text("Latest summary (${latest.dirName}):", fontWeight = FontWeight.SemiBold)
+                        val text = remember(summaryPath.path) { summaryPath.readText() }
+                        Text(text)
+                    } else {
+                        Text("Summary file not found for latest snapshot.")
+                    }
                 }
             }
-            Divider()
         }
     }
 }

@@ -15,11 +15,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import com.bgmonitoring.shizuku.ShizukuShell
 import androidx.work.WorkManager
+import com.bgmonitoring.snapshot.AnalysisResult
+import com.bgmonitoring.snapshot.SnapshotAnalyzer
 
 data class UiState(
     val targetPackage: String = "",
@@ -33,7 +34,8 @@ data class UiState(
     val snapshotCounts: Map<String, Int> = emptyMap(),
     val selectedPackage: String? = null,
     val collectingNow: Boolean = false,
-    val snapshotVersion: Int = 0
+    val snapshotVersion: Int = 0,
+    val analysisState: MainViewModel.AnalyzeState = MainViewModel.AnalyzeState.Idle
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -44,6 +46,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val countsFlow = MutableStateFlow<Map<String, Int>>(emptyMap())
     private val collecting = MutableStateFlow(false)
     private val snapshotVersion = MutableStateFlow(0)
+    private val analysis = MutableStateFlow<AnalyzeState>(AnalyzeState.Idle)
+    private val analyzer = SnapshotAnalyzer()
 
     val state: StateFlow<UiState> = repo.settingsFlow
         .combine(status) { settings, status ->
@@ -66,6 +70,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         .combine(selected) { ui, sel -> ui.copy(selectedPackage = sel) }
         .combine(collecting) { ui, isCollecting -> ui.copy(collectingNow = isCollecting) }
         .combine(snapshotVersion) { ui, ver -> ui.copy(snapshotVersion = ver) }
+        .combine(analysis) { ui, a -> ui.copy(analysisState = a) }
         .stateIn(viewModelScope, SharingStarted.Eagerly, UiState())
 
     fun refreshStatus() {
@@ -115,7 +120,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val updated = countsFlow.value.toMutableMap()
         updated[pkg] = countSnapshots(pkg)
         countsFlow.value = updated
-        snapshotVersion.value = snapshotVersion.value + 1
+        snapshotVersion.value += 1
+        analysis.value = AnalyzeState.Idle
     }
 
     fun loadInstalledApps() {
@@ -133,36 +139,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .distinct()
                 .sorted()
                 .toList()
-            val labelMap = fetchLabels(packages)
+            val pm = getApplication<Application>().packageManager
             val list = packages.map { pkg ->
-                InstalledApp(
-                    label = labelMap[pkg] ?: pkg,
-                    packageName = pkg
-                )
+                try {
+                    val info = pm.getApplicationInfo(pkg, 0)
+                    val label = pm.getApplicationLabel(info).toString()
+                    InstalledApp(label = label, packageName = pkg, hasIcon = true)
+                } catch (_: Exception) {
+                    InstalledApp(label = pkg, packageName = pkg, hasIcon = false)
+                }
             }
             appsFlow.value = list
             refreshCounts(packages)
         }
     }
 
-    /**
-     * Attempts to fetch app labels using package manager; if not accessible, falls back to pkg name.
-     * Since we list only user apps (-3), labels should be accessible without extra perms.
-     */
-    private fun fetchLabels(packages: List<String>): Map<String, String> {
-        return try {
-            val pm = getApplication<Application>().packageManager
-            packages.associateWith { pkg ->
-                pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
-            }
-        } catch (e: Exception) {
-            emptyMap()
-        }
-    }
-
     fun selectPackage(pkg: String) {
         selected.value = pkg
         updateTarget(pkg)
+        analysis.value = AnalyzeState.Idle
     }
 
     fun backToList() {
@@ -194,6 +189,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         ShizukuHelper.requestPermission(requestCode)
     }
 
+    fun analyzeSelected() {
+        val pkg = selected.value ?: state.value.selectedPackage ?: return
+        val root = File(getApplication<Application>().filesDir, "snapshots/$pkg")
+        viewModelScope.launch(Dispatchers.IO) {
+            analysis.value = AnalyzeState.Running
+            val result = try {
+                analyzer.analyze(root)
+            } catch (e: Exception) {
+                AnalysisResult.Error(e.message ?: "error")
+            }
+            analysis.value = when (result) {
+                is AnalysisResult.Success -> AnalyzeState.Success(result)
+                is AnalysisResult.NotEnoughData -> AnalyzeState.Error("Not enough snapshots to analyze")
+                is AnalysisResult.Error -> AnalyzeState.Error(result.message)
+            }
+        }
+    }
+
+    sealed interface AnalyzeState {
+        object Idle : AnalyzeState
+        object Running : AnalyzeState
+        data class Success(val result: AnalysisResult.Success) : AnalyzeState
+        data class Error(val message: String) : AnalyzeState
+    }
+
     private fun readStatus(): SystemStatus {
         val app = getApplication<Application>()
         val pm = app.getSystemService(android.os.PowerManager::class.java)
@@ -214,6 +234,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     data class InstalledApp(
         val label: String,
-        val packageName: String
+        val packageName: String,
+        val hasIcon: Boolean
     )
 }

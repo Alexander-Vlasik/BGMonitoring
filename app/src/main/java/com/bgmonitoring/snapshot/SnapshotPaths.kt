@@ -40,4 +40,14 @@ object SnapshotPaths {
         fmt.timeZone = TimeZone.getTimeZone("UTC")
         return fmt.format(Date(timestamp))
     }
+
+    fun parseUtc(utc: String): Long {
+        return try {
+            val fmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+            fmt.timeZone = TimeZone.getTimeZone("UTC")
+            fmt.parse(utc)?.time ?: 0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
 }
